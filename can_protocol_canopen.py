@@ -87,9 +87,13 @@ class CanOpenProtocol:
         # Wait for SDO response from node (COB-ID 0x580 + node_id)
         deadline = time.monotonic() + SDO_TIMEOUT
         while time.monotonic() < deadline:
-            msg = self._bus.recv(timeout=0.1)
-            if msg and msg.arbitration_id == (0x580 + node_id):
-                return msg.data[0] == 0x60   # 0x60 = success
+            msg = self._bus.recv_matching(
+                lambda msg: msg.arbitration_id == (0x580 + node_id),
+                timeout=min(0.1, deadline - time.monotonic()),
+            )
+
+            if msg is not None:
+                return msg.data[0] == 0x60
 
         return False   # timed out
 
@@ -152,8 +156,12 @@ class CanOpenProtocol:
         """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            msg = self._bus.recv(timeout=0.1)
-            if msg and msg.arbitration_id == (0x180 + node_id):
+            msg = self._bus.recv_matching(
+                lambda msg: msg.arbitration_id == (0x180 + node_id),
+                timeout=min(0.1, deadline - time.monotonic()),
+            )
+
+            if msg is not None:
                 pos = struct.unpack_from("<i", msg.data, 0)[0]
                 sw  = struct.unpack_from("<H", msg.data, 4)[0]
                 return pos, sw

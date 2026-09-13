@@ -51,88 +51,7 @@ CUBEMARS_NODE_IDS = [2, 3]
 
 SYNC_INTERVAL         = 0.002   # seconds — must match state_machine.py
 STATUS_PRINT_INTERVAL = 50      # ticks between heartbeat prints
-CUBEMARS_SEND_INTERVAL = 0.020  # seconds between hold commands (50Hz)
 
-# Hold speed/accel for CubeMars idle hold — conservative
-HOLD_SPEED_ERPM = 2000
-HOLD_ACCEL_ERPM = 2000
-
-# ============================================================
-# CUBEMARS HOLD MANAGER
-# ============================================================
-
-class CubeMarsHoldManager:
-    """
-    Sends continuous position-velocity hold commands to all
-    CubeMars motors on a dedicated background thread.
-
-    The state machine calls update_position() every tick after
-    stepping a CubeMars node so the hold manager always knows
-    the latest commanded position.
-
-    Uses a separate CAN bus instance so its sends never compete
-    with the main bus recv() calls in the tick loop.
-    """
-
-    def __init__(self, hold_bus):
-        self._bus        = hold_bus
-        self._positions  = {}   # drive_id -> degrees
-        self._lock       = threading.Lock()
-        self._stop_event = threading.Event()
-        self._thread     = None
-
-    def set_position(self, drive_id, pos_deg):
-        with self._lock:
-            self._positions[drive_id] = pos_deg
-
-    def clear_position(self, drive_id):
-        with self._lock:
-            self._positions.pop(drive_id, None)
-
-    def clear_all(self):
-        with self._lock:
-            self._positions.clear()
-
-    def start(self):
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._loop, daemon=True
-        )
-        self._thread.start()
-
-    def stop(self):
-        self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=1.0)
-
-    def _send(self, drive_id, pos_deg):
-        arb_id  = (6 << 8) | drive_id
-        pos_raw = int(pos_deg * 10000.0)
-        spd_raw = int(HOLD_SPEED_ERPM / 10)
-        acc_raw = int(HOLD_ACCEL_ERPM / 10)
-        data    = struct.pack('>ihh', pos_raw, spd_raw, acc_raw)
-        self._bus.send(can.Message(
-            arbitration_id = arb_id,
-            data           = data,
-            is_extended_id = True,
-        ))
-
-    def _loop(self):
-        next_send = time.monotonic()
-        while not self._stop_event.is_set():
-            with self._lock:
-                positions = dict(self._positions)
-            for drive_id, pos_deg in positions.items():
-                try:
-                    self._send(drive_id, pos_deg)
-                except Exception as e:
-                    print(f"  [HoldManager] Send failed: {e}")
-            next_send += CUBEMARS_SEND_INTERVAL
-            remaining  = next_send - time.monotonic()
-            if remaining > 0:
-                time.sleep(remaining)
-            else:
-                next_send = time.monotonic()
 
 # ============================================================
 # LOAD NODES FROM JSON
@@ -177,11 +96,9 @@ def load_nodes(canopen_protocol, cubemars_protocol):
 # CUBEMARS STARTUP
 # ============================================================
 
-def enable_cubemars_motors(cubemars_nodes, hold_manager):
+def start_cubemars_holding(cubemars_nodes):
     """
-    Enable all CubeMars motors and register them with the
-    hold manager so they hold position from the moment the
-    script starts, before any ENABLE command is issued.
+    Enable all CubeMars motors.
 
     Returns True if all motors responded, False if any failed.
     """
@@ -189,15 +106,13 @@ def enable_cubemars_motors(cubemars_nodes, hold_manager):
     all_ok = True
 
     for node in cubemars_nodes:
-        ok = node.enable()
+        ok = node.start_holding()
         if not ok:
             print(f"  WARNING: {node.name} (motor {node.node_id})"
                   f" failed to enable — will not hold")
             all_ok = False
             continue
 
-        # Register with hold manager at current position
-        hold_manager.set_position(node.node_id, node.position)
         print(f"  Motor {node.node_id} ({node.name})"
               f" holding at {node.position:.1f} deg")
 
@@ -332,12 +247,9 @@ def main():
     print()
 
     # --------------------------------------------------------
-    # Open CAN buses
-    # Two instances: main bus for all protocol I/O,
-    # hold bus dedicated to CubeMars background hold sends
+    # Open CAN bus: main bus for all protocol I/O,
     # --------------------------------------------------------
     main_bus = CanBus()
-    hold_bus = can.Bus(channel="can0", interface="socketcan")
 
     try:
         main_bus.open()
@@ -358,22 +270,21 @@ def main():
     except Exception as e:
         print(f"  ERROR: Could not load home positions: {e}")
         main_bus.close()
-        hold_bus.shutdown()
         return
 
-    # --------------------------------------------------------
-    # Start hold manager and pre-enable CubeMars motors
-    # --------------------------------------------------------
-    hold_manager = CubeMarsHoldManager(hold_bus)
-    hold_manager.start()
-
-    enable_cubemars_motors(cubemars_nodes, hold_manager)
+    cubemars_startup_ok = start_cubemars_holding(cubemars_nodes)
 
     # --------------------------------------------------------
     # Build state machine with all nodes
     # --------------------------------------------------------
     all_nodes = avatar_nodes + cubemars_nodes
     sm        = ArmStateMachine(all_nodes, canopen_protocol)
+
+    if not cubemars_startup_ok:
+        sm.handle_command(Command(
+            type="ESTOP",
+            reason="One or more CubeMars motors failed startup initialization",
+        ))
 
     # --------------------------------------------------------
     # Keyboard input thread
@@ -422,20 +333,11 @@ def main():
             # 3. Tick state machine
             sm.tick()
 
-            # 4. Update hold manager with latest CubeMars positions
-            #    so the background thread always holds the most
-            #    recently commanded position
-            for node in cubemars_nodes:
-                if node.position is not None:
-                    hold_manager.set_position(
-                        node.node_id, node.position
-                    )
-
-            # 5. Heartbeat print
+            # 4. Heartbeat print
             # if sm.status().tick % STATUS_PRINT_INTERVAL == 0:
             #     print_status(sm.status())
 
-            # 6. Sleep remainder of tick
+            # 5. Sleep remainder of tick
             elapsed   = time.monotonic() - tick_start
             remaining = SYNC_INTERVAL - elapsed
             if remaining > 0:
@@ -459,16 +361,18 @@ def main():
                 except Exception:
                     pass
 
-        # Disable CubeMars motors and stop hold manager
-        hold_manager.stop()
+        # Disable CubeMars motors
         for node in cubemars_nodes:
             try:
                 node.disable()
-            except Exception:
-                pass
+                node.release_torque()
+            except Exception as exc:
+                print(
+                    f"Failed to release torque on "
+                    f"{node.name}: {exc}"
+                )
 
         main_bus.close()
-        hold_bus.shutdown()
         print("  Done.")
         print()
 

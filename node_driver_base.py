@@ -114,6 +114,15 @@ class NodeDriverBase(ABC):
         """
         return False   # default — Avatar motors hold passively
 
+    @property
+    def holding_active(self):
+        """
+        True when this node is actively maintaining its position.
+
+        Avatar nodes hold passively, so this defaults to False.
+        """
+        return False
+
     # --------------------------------------------------------
     # Lifecycle
     # --------------------------------------------------------

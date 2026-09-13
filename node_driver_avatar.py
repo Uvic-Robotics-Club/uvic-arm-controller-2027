@@ -36,6 +36,7 @@ Usage
     bus.close()
 """
 
+import struct
 import time
 
 from node_driver_base import NodeDriverBase, NodeState
@@ -61,8 +62,10 @@ PRIME_TICKS = 20
 # SYNC interval — must match the state machine tick rate
 SYNC_INTERVAL = 0.020   # seconds
 
-# Statusword fault bit (bit 3)
-SW_FAULT_BIT = 0x0008
+# Statusword bits
+SW_FAULT_BIT         = 0x0008   # bit 3  — fault
+SW_TARGET_REACHED    = 0x0400   # bit 10 — target reached
+
 
 # Maximum position divergence before watchdog triggers.
 # If the drive reports a position more than this many counts
@@ -70,7 +73,6 @@ SW_FAULT_BIT = 0x0008
 # Set conservatively — can be tuned once position feedback
 # is confirmed reliable on these drives.
 MAX_POSITION_DIVERGENCE = 50000   # counts
-
 
 class AvatarNode(NodeDriverBase):
     """
@@ -275,44 +277,43 @@ class AvatarNode(NodeDriverBase):
 
     def check_watchdog(self):
         """
-        Check for fault conditions on this node.
+        Check the latest cached TPDO1 without consuming a CAN frame.
 
-        Currently checks:
-        - Whether a TPDO has arrived with the fault bit set.
-
-        Position divergence checking is noted but disabled until
-        TPDO position feedback is confirmed reliable on these drives
-        (the ~10 Hz update rate makes mid-move checks unreliable).
+        Fault conditions:
+        - Statusword fault bit is set AND target-reached is clear.
 
         Returns True if healthy, False if a fault was detected.
-        Sets state to FAULT on failure.
         """
-        # Non-blocking TPDO check — timeout=0 means return immediately
-        # if nothing is in the receive buffer
-        msg = self._protocol._bus.recv(timeout=0)
 
-        if msg and msg.arbitration_id == (0x180 + self._node_id):
-            import struct
-            sw = struct.unpack_from("<H", msg.data, 4)[0]
+        msg, timestamp = self._protocol._bus.get_latest(
+            0x180 + self._node_id,
+            is_extended_id=False,
+        )
 
-            if sw & SW_FAULT_BIT:
-                print(
-                    f"  [{self._name}] FAULT detected in statusword"
-                    f" 0x{sw:04X}"
-                )
-                self._state = NodeState.FAULT
-                return False
+        # No feedback has arrived yet.
+        if msg is None:
+            print(f"  [{self._name}] No TPDO1 feedback received.")
+            self._state = NodeState.FAULT
+            return False
 
-        # Position divergence check — disabled until TPDO feedback
-        # is confirmed reliable.  Uncomment and tune MAX_POSITION_DIVERGENCE
-        # once that is established.
-        #
-        # if msg and msg.arbitration_id == (0x180 + self._node_id):
-        #     actual_pos = struct.unpack_from("<i", msg.data, 0)[0]
-        #     if abs(actual_pos - self._position) > MAX_POSITION_DIVERGENCE:
-        #         print(f"  [{self._name}] Position divergence fault")
-        #         self._state = NodeState.FAULT
-        #         return False
+        # TPDO1 layout: position (4 bytes), statusword (2 bytes).
+        if len(msg.data) < 6:
+            print(f"  [{self._name}] Invalid TPDO1 payload length.")
+            self._state = NodeState.FAULT
+            return False
+
+        sw = struct.unpack_from("<H", msg.data, 4)[0]
+
+        fault_bit = bool(sw & SW_FAULT_BIT)
+        target_reached = bool(sw & SW_TARGET_REACHED)
+
+        if fault_bit and not target_reached:
+            print(
+                f"  [{self._name}] FAULT detected in statusword"
+                f" 0x{sw:04X}"
+            )
+            self._state = NodeState.FAULT
+            return False
 
         return True
 

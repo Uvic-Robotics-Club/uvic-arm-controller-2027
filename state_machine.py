@@ -40,6 +40,7 @@ Usage
         time.sleep(max(0, SYNC_INTERVAL - elapsed))
 """
 
+import time
 from dataclasses import dataclass, field
 from enum        import Enum, auto
 from typing      import Optional
@@ -56,6 +57,10 @@ WAYPOINT_STEP = 250     # encoder counts per tick
 SYNC_INTERVAL = 0.002   # seconds — must match main.py tick rate
 PRIME_TICKS   = 20      # hold-position ticks after enable
 
+
+# CubeMars position commands are sent at 50 Hz,
+# independently of the 500 Hz state-machine tick.
+CUBEMARS_COMMAND_INTERVAL = 0.020
 
 # ============================================================
 # ARM STATES
@@ -91,6 +96,7 @@ class Command:
     """
     type:    str
     targets: Optional[dict] = None
+    reason: Optional[str] = None
 
 
 # ============================================================
@@ -151,6 +157,9 @@ class ArmStateMachine:
         self._tick_index:  int  = 0
         self._total_ticks: int  = 0
 
+        # Last time a continuous-hold motor (CubeMars) was commanded.
+        self._last_cubemars_command_time = 0.0
+
     # --------------------------------------------------------
     # Public interface
     # --------------------------------------------------------
@@ -187,13 +196,27 @@ class ArmStateMachine:
             self._cmd_disable()
 
         elif t == "ESTOP":
-            self._cmd_estop("Operator ESTOP")
+            self._cmd_estop(cmd.reason or "Operator ESTOP")
 
         elif t == "RESET":
             self._cmd_reset()
 
         else:
             print(f"  [SM] Unknown command: {cmd.type!r}")
+
+    def _cubemars_command_due(self):
+        """
+        Return True when it is time to send another CubeMars command.
+        All CubeMars nodes share the same transmission interval.
+        """
+        now = time.monotonic()
+
+        if (now - self._last_cubemars_command_time
+                >= CUBEMARS_COMMAND_INTERVAL):
+            self._last_cubemars_command_time = now
+            return True
+
+        return False
 
     def tick(self):
         """
@@ -207,16 +230,33 @@ class ArmStateMachine:
         """
         try:
             # 1. Watchdog
-            if self._state in (ArmState.IDLE, ArmState.MOVING,
-                            ArmState.HOMING):
-                for node in self._nodes.values():
-                    if node.state == NodeState.ENABLED:
-                        if not node.check_watchdog():
-                            self._enter_fault(
-                                f"Watchdog fault on node"
-                                f" {node.node_id} ({node.name})"
-                            )
-                            return
+            for node in self._nodes.values():
+
+                # CubeMars motors must be monitored whenever they are holding,
+                # even when movement is disabled or the arm is in FAULT.
+                if node.requires_continuous_hold:
+                    should_check = (
+                        node.holding_active
+                        and node.state != NodeState.FAULT
+                    )
+
+                # Avatar motors are monitored while the arm is operational.
+                else:
+                    should_check = (
+                        self._state in (
+                            ArmState.IDLE,
+                            ArmState.MOVING,
+                            ArmState.HOMING,
+                        )
+                        and node.state == NodeState.ENABLED
+                    )
+
+                if should_check and not node.check_watchdog():
+                    self._enter_fault(
+                        f"Watchdog fault on node"
+                        f" {node.node_id} ({node.name})"
+                    )
+                    return
 
             # 2. Trajectory
             if self._state in (ArmState.MOVING, ArmState.HOMING):
@@ -225,11 +265,15 @@ class ArmStateMachine:
             # 3. CubeMars idle hold — step at current position
             #    every tick so position tracking stays accurate.
             #    Avatar nodes hold passively so don't need this.
-            elif self._state == ArmState.IDLE:
-                for node in self._nodes.values():
-                    if (node.state == NodeState.ENABLED
-                            and node.requires_continuous_hold):
-                        node.step(node.position)
+            elif self._state in (ArmState.DISABLED, ArmState.IDLE, ArmState.FAULT):
+                if self._cubemars_command_due():
+                    for node in self._nodes.values():
+                        if (
+                            node.requires_continuous_hold
+                            and node.holding_active
+                            and node.state != NodeState.FAULT
+                        ):
+                            node.hold()
 
         except CanBusError as e:
             self._enter_fault(f"CAN bus error: {e}")
@@ -276,11 +320,17 @@ class ArmStateMachine:
 
         try:
             for node in self._nodes.values():
-                if node.state == NodeState.ENABLED:
-                    # Already enabled from pre-enable step — skip
-                    print(f"  [{node.name}] Already enabled — skipping")
-                    continue
-                ok = node.enable()
+                if node.requires_continuous_hold:
+                    if node.state == NodeState.FAULT:
+                        self._enter_fault(
+                            f"CubeMars node {node.node_id} is faulted"
+                        )
+                        return
+
+                    ok = node.enable()
+                else:
+                    ok = node.enable()
+
                 if not ok:
                     self._enter_fault(
                         f"Failed to enable node {node.node_id} ({node.name})"
@@ -461,7 +511,7 @@ class ArmStateMachine:
         # This handles the difference between Avatar (counts)
         # and CubeMars (degrees) units.
         direction = 1 if delta > 0 else -1
-        step      = direction * abs(WAYPOINT_STEP)
+        step = direction * abs(step_size)
 
         waypoints = []
         current   = start
@@ -483,9 +533,33 @@ class ArmStateMachine:
             self._finish_trajectory()
             return
 
-        # Step each node with its waypoint for this tick
-        for node_id, wps in self._waypoints.items():
-            self._nodes[node_id].step(wps[self._tick_index])
+        # Send Avatar waypoints every tick.
+        # Send CubeMars commands at 50 Hz.
+        #
+        # Every healthy CubeMars motor receives a command, even if it
+        # isn't part of the current trajectory.
+
+        cubemars_due = self._cubemars_command_due()
+
+        for node_id, node in self._nodes.items():
+
+            if node.requires_continuous_hold:
+
+                if not cubemars_due:
+                    continue
+
+                if not node.holding_active or node.state == NodeState.FAULT:
+                    continue
+
+                if node_id in self._waypoints:
+                    waypoint = self._waypoints[node_id][self._tick_index]
+                    node.step(waypoint)
+                else:
+                    node.hold()
+
+            elif node_id in self._waypoints:
+                waypoint = self._waypoints[node_id][self._tick_index]
+                node.step(waypoint)
 
         # One SYNC clocks all nodes simultaneously
         self._protocol.send_sync()
@@ -499,8 +573,19 @@ class ArmStateMachine:
         """
         # Send final position to all nodes a few more times so the
         # drive doesn't stall at the last waypoint
+        # Ensure the final target is sent to every node.
+        # CubeMars only needs this final command once.
+        hold_ticks = self._tick_index - self._total_ticks
+
         for node_id, wps in self._waypoints.items():
-            self._nodes[node_id].step(wps[-1])
+            node = self._nodes[node_id]
+
+            if node.requires_continuous_hold:
+                if hold_ticks == 0:
+                    node.step(wps[-1])
+                    self._last_cubemars_command_time = time.monotonic()
+            else:
+                node.step(wps[-1])
         self._protocol.send_sync()
 
         # Once we've held long enough, transition
@@ -530,7 +615,8 @@ class ArmStateMachine:
         self._tick_index   = 0
         self._total_ticks  = 0
 
-        # Best-effort disable of all enabled nodes
+        # Revoke movement permission from every node.
+        # CubeMars disable() preserves its holding behaviour.
         for node in self._nodes.values():
             if node.state == NodeState.ENABLED:
                 try:

@@ -85,45 +85,40 @@ class CubeMarsProtocol:
         return (mode_id << 8) | drive_id
 
     def _send(self, mode_id, drive_id, data=b''):
-        """Send one extended CAN frame."""
+        """Send one extended CAN frame through the shared CanBus."""
         arb_id = self._make_arb_id(mode_id, drive_id)
-        msg_data = bytes(data)
 
-        import can
-        msg = can.Message(
-            arbitration_id = arb_id,
-            data           = msg_data,
-            is_extended_id = True,          # CubeMars uses 29-bit IDs
+        self._bus.send(
+            arb_id=arb_id,
+            data=bytes(data),
+            is_extended_id=True,
         )
-        self._bus._bus.send(msg)
 
     def _recv_from(self, drive_id, func_id=None, timeout=_RECV_TIMEOUT):
         """
-        Wait for a frame from drive_id.
-
-        If func_id is given, only return frames whose upper bits
-        match that function ID.  Returns the can.Message or None.
+        Retrieve a buffered extended frame from a specific motor.
+        Unrelated CAN frames remain available to other consumers.
         """
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            msg = self._bus._bus.recv(timeout=min(remaining, 0.05))
-            if msg is None:
-                continue
+
+        def matches(msg):
             if not msg.is_extended_id:
-                continue
+                return False
 
             msg_drive_id = msg.arbitration_id & 0xFF
-            msg_func_id  = (msg.arbitration_id >> 8) & 0xFFFFFF
+            msg_func_id = (msg.arbitration_id >> 8) & 0xFFFFFF
 
             if msg_drive_id != drive_id:
-                continue
+                return False
+
             if func_id is not None and msg_func_id != func_id:
-                continue
+                return False
 
-            return msg
+            return True
 
-        return None
+        return self._bus.recv_matching(
+            matches,
+            timeout=timeout,
+        )
 
     # --------------------------------------------------------
     # Feedback enable
@@ -195,6 +190,26 @@ class CubeMarsProtocol:
             return None
 
         return self._parse_status(msg.data)
+
+    def read_latest_status(self, drive_id):
+        """
+        Return the latest cached status frame without consuming it.
+
+        Returns:
+            (status, timestamp), or (None, None) if no status
+            frame has been received.
+        """
+        arb_id = (_FUNC_STATUS << 8) | drive_id
+
+        msg, timestamp = self._bus.get_latest(
+            arb_id,
+            is_extended_id=True,
+        )
+
+        if msg is None:
+            return None, None
+
+        return self._parse_status(msg.data), timestamp
 
     def _parse_status(self, data):
         """

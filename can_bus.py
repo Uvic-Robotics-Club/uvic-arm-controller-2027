@@ -27,7 +27,10 @@ Usage
 """
 
 import can
+import threading
+import time
 
+from collections import deque
 
 DEFAULT_CHANNEL   = "can0"
 DEFAULT_INTERFACE = "socketcan"
@@ -54,28 +57,102 @@ class CanBus:
         self._channel   = channel
         self._interface = interface
         self._bus       = None
+        # Receive management
+        self._rx_queue = deque(maxlen=4096)
+        self._latest_frames = {}
+
+        self._rx_condition = threading.Condition()
+        self._rx_stop = threading.Event()
+        self._rx_thread = None
+
+        # Prevent simultaneous sends from interleaving.
+        self._tx_lock = threading.Lock()
 
     # --------------------------------------------------------
     # Lifecycle
     # --------------------------------------------------------
 
     def open(self):
-        """Open the CAN interface.  Must be called before send/recv."""
+        """Open the CAN interface and start centralized reception."""
         if self._bus is not None:
             return
+
         try:
             self._bus = can.Bus(
-                channel   = self._channel,
-                interface = self._interface,
+                channel=self._channel,
+                interface=self._interface,
             )
         except Exception as e:
-            raise CanBusError(f"Failed to open {self._channel}: {e}") from e
+            raise CanBusError(
+                f"Failed to open {self._channel}: {e}"
+            ) from e
+
+        self._rx_stop.clear()
+
+        self._rx_thread = threading.Thread(
+            target=self._receive_loop,
+            name="CAN-Receiver",
+            daemon=True,
+        )
+
+        self._rx_thread.start()
+
+    def _receive_loop(self):
+        """
+        Read every incoming CAN frame from the physical interface.
+
+        This is the ONLY method that should directly call
+        python-can's recv().
+        """
+        while not self._rx_stop.is_set():
+            try:
+                msg = self._bus.recv(timeout=0.1)
+
+                if msg is None:
+                    continue
+
+                with self._rx_condition:
+                    self._rx_queue.append(msg)
+
+                    key = (
+                        msg.is_extended_id,
+                        msg.arbitration_id,
+                    )
+
+                    self._latest_frames[key] = (
+                        msg,
+                        time.monotonic(),
+                    )
+
+                    self._rx_condition.notify_all()
+
+            except Exception as e:
+                if self._rx_stop.is_set():
+                    break
+
+                print(f"[CAN RX] Receive error: {e}")
+                time.sleep(0.01)
 
     def close(self):
-        """Shut down the CAN interface cleanly."""
-        if self._bus is not None:
-            self._bus.shutdown()
-            self._bus = None
+        """Stop reception and shut down the CAN interface."""
+        if self._bus is None:
+            return
+
+        self._rx_stop.set()
+
+        with self._rx_condition:
+            self._rx_condition.notify_all()
+
+        if self._rx_thread is not None:
+            self._rx_thread.join(timeout=1.0)
+            self._rx_thread = None
+
+        self._bus.shutdown()
+        self._bus = None
+
+        with self._rx_condition:
+            self._rx_queue.clear()
+            self._latest_frames.clear()
 
     def __enter__(self):
         self.open()
@@ -94,76 +171,93 @@ class CanBus:
     # Raw send
     # --------------------------------------------------------
 
-    def send(self, arb_id, data):
+    def send(self, arb_id, data, is_extended_id=False):
         """
-        Send a single CAN frame.
- 
-        Parameters
-        ----------
-        arb_id : int            11-bit arbitration ID
-        data   : bytes | list   Up to 8 bytes of payload
- 
-        Raises
-        ------
-        CanBusError
-            If the interface is down or the frame could not be sent.
-            Common cause: socketcan interface not brought up, or
-            bitrate mismatch (expected 1 Mbps).
-            Run:  sudo ip link set can0 up type can bitrate 1000000
+        Send a standard or extended CAN frame.
         """
         self._require_open()
- 
+
         msg = can.Message(
-            arbitration_id = arb_id,
-            data           = bytes(data),
-            is_extended_id = False,
+            arbitration_id=arb_id,
+            data=bytes(data),
+            is_extended_id=is_extended_id,
         )
- 
+
         try:
-            self._bus.send(msg)
- 
+            with self._tx_lock:
+                self._bus.send(msg)
+
         except OSError as e:
-            if e.errno == 105:
-                # Errno 105: No buffer space available.
-                # The kernel socketcan TX queue is full — transient
-                # congestion at high send rates.  Wait one tick and
-                # retry once before faulting.
-                # Permanent fix: sudo ip link set can0 txqueuelen 1000
-                import time
-                time.sleep(0.002)
-                try:
-                    self._bus.send(msg)
-                except Exception as retry_e:
-                    raise CanBusError(
-                        f"CAN TX buffer full and retry failed: {retry_e}\n"
-                        f"  Run: sudo ip link set can0 txqueuelen 1000"
-                    ) from retry_e
-            elif e.errno == 100:
+            if e.errno == 100:
                 raise CanBusError(
-                    f"CAN interface is down: {e}\n"
-                    f"  Run: sudo ip link set can0 up type can bitrate 1000000"
+                    f"CAN interface is down: {e}"
                 ) from e
-            else:
-                raise CanBusError(f"CAN send failed (errno {e.errno}): {e}") from e
- 
+
+            if e.errno == 105:
+                raise CanBusError(
+                    "CAN TX buffer full (ENOBUFS). "
+                    "Transmission could not be queued."
+                ) from e
+
+            raise CanBusError(
+                f"CAN send failed (errno {e.errno}): {e}"
+            ) from e
+
         except Exception as e:
             raise CanBusError(f"CAN send failed: {e}") from e
 
     # --------------------------------------------------------
-    # Raw recv
+    # Recv
     # --------------------------------------------------------
+
+    def recv_matching(self, predicate, timeout=0.1):
+        """
+        Retrieve the next buffered frame satisfying predicate.
+
+        Frames that do not match remain available for other consumers.
+        """
+        self._require_open()
+
+        deadline = time.monotonic() + timeout
+
+        with self._rx_condition:
+            while True:
+
+                for index, msg in enumerate(self._rx_queue):
+                    if predicate(msg):
+                        del self._rx_queue[index]
+                        return msg
+
+                remaining = deadline - time.monotonic()
+
+                if remaining <= 0:
+                    return None
+
+                self._rx_condition.wait(timeout=remaining)
+
 
     def recv(self, timeout=0.1):
         """
-        Wait for the next CAN frame.
+        Retrieve the next buffered frame, regardless of its ID.
 
-        Parameters
-        ----------
-        timeout : float   Seconds to wait.  0 = non-blocking.
+        Prefer recv_matching() in protocol implementations.
+        """
+        return self.recv_matching(
+            lambda msg: True,
+            timeout=timeout,
+        )
 
-        Returns
-        -------
-        can.Message on success, or None on timeout.
+
+    def get_latest(self, arb_id, is_extended_id=False):
+        """
+        Return the most recently received frame for an arbitration ID.
+
+        Returns:
+            (message, timestamp) or (None, None)
         """
         self._require_open()
-        return self._bus.recv(timeout=timeout)
+
+        key = (is_extended_id, arb_id)
+
+        with self._rx_condition:
+            return self._latest_frames.get(key, (None, None))

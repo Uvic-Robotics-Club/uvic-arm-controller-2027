@@ -58,7 +58,6 @@ DEFAULT_ACCEL_ERPM = 20000
 
 # Temperature fault thresholds
 MAX_MOTOR_TEMP  = 70    # degrees C
-MAX_MOSFET_TEMP = 80    # degrees C
 
 # Maximum position divergence before watchdog triggers (degrees)
 MAX_POSITION_DIVERGENCE = 10.0
@@ -122,6 +121,8 @@ class CubeMarsNode(NodeDriverBase):
 
         self._state      = NodeState.DISABLED
         self._position   = None   # degrees, unknown until enable()
+        self._motion_enabled = False
+        self._holding_active = False
 
         self.waypoint_step = 0.5   # degrees per 2ms tick
 
@@ -136,6 +137,10 @@ class CubeMarsNode(NodeDriverBase):
     @property
     def name(self):
         return self._name
+
+    @property
+    def motion_enabled(self):
+        return self._motion_enabled
 
     # --------------------------------------------------------
     # State
@@ -153,33 +158,29 @@ class CubeMarsNode(NodeDriverBase):
     def requires_continuous_hold(self):
         return True
 
+    @property
+    def holding_active(self):
+        return self._holding_active
+
     # --------------------------------------------------------
     # Lifecycle
     # --------------------------------------------------------
 
-    def enable(self):
+    def start_holding(self):
         """
-        Enable the motor and read its initial position.
+        Initialize feedback and begin holding the motor's
+        measured position.
 
-        Sequence
-        --------
-        1. Enable feedback broadcasts
-        2. Read initial position from status frame
-        3. Send hold command at current position
-        4. Prime hold for PRIME_TICKS before returning
-
-        Returns True on success, False on failure.
+        This is independent of movement permission.
         """
-        print(f"  [{self._name}] Enabling motor {self._node_id}...")
+        print(f"  [{self._name}] Initializing hold on motor {self._node_id}...")
 
-        # Enable periodic status broadcasts
         ok = self._protocol.enable_feedback(self._node_id)
         if not ok:
             print(f"  [{self._name}] No response from motor.")
             self._state = NodeState.FAULT
             return False
 
-        # Read initial position
         status = self._protocol.read_status(self._node_id, timeout=2.0)
         if status is None:
             print(f"  [{self._name}] Could not read initial position.")
@@ -188,35 +189,86 @@ class CubeMarsNode(NodeDriverBase):
 
         if status['error'] != 0:
             print(
-                f"  [{self._name}] Motor fault on enable:"
+                f"  [{self._name}] Motor fault during startup:"
                 f" error={status['error']}"
             )
             self._state = NodeState.FAULT
             return False
 
         self._position = status['position']
-        self._state    = NodeState.ENABLED
+        self._holding_active = True
+
+        self.prime(PRIME_TICKS)
 
         print(
-            f"  [{self._name}] Enabled"
+            f"  [{self._name}] Holding"
             f" | pos={self._position:.1f} deg"
             f" | temp={status['temp']}C"
         )
 
-        # Prime — hold current position before tick loop takes over
-        self.prime(PRIME_TICKS)
+        return True
 
+    def enable(self):
+        """
+        Permit new movement commands.
+
+        Holding must already have been initialized.
+        """
+        if not self._holding_active or self._position is None:
+            print(f"  [{self._name}] Cannot enable: holding not initialized.")
+            return False
+
+        self._motion_enabled = True
+        self._state = NodeState.ENABLED
+
+        print(f"  [{self._name}] Movement enabled.")
         return True
 
     def disable(self):
-        """Send the motor disable command and set state to DISABLED."""
+        """
+        Revoke movement permission without disabling the motor.
+
+        The motor continues receiving holding commands.
+        """
+        self._motion_enabled = False
+
+        if self._holding_active:
+            self._state = NodeState.DISABLED
+            print(f"  [{self._name}] Movement disabled; holding continues.")
+        else:
+            self._state = NodeState.DISABLED
+
+    def release_torque(self):
+        """
+        Release motor torque.
+
+        This is intended for controller shutdown, not ordinary DISABLE.
+        """
+        self._motion_enabled = False
+
+        # Send CubeMars mode 15 (motor disable).
         self._protocol.disable(self._node_id)
-        self._state = NodeState.DISABLED
-        print(f"  [{self._name}] Disabled.")
+
+        self._holding_active = False
+
+        if self._state != NodeState.FAULT:
+            self._state = NodeState.DISABLED
 
     # --------------------------------------------------------
     # Motion
     # --------------------------------------------------------
+
+    def hold(self):
+        """Maintain the currently stored holding position."""
+        if not self._holding_active or self._position is None:
+            return
+
+        self._protocol.send_pos_vel(
+            self._node_id,
+            self._position,
+            self._speed_erpm,
+            self._accel_erpm,
+        )
 
     def step(self, waypoint):
         """
@@ -230,6 +282,9 @@ class CubeMarsNode(NodeDriverBase):
         ----------
         waypoint : float   Target position in degrees.
         """
+        if not self._motion_enabled:
+            return
+
         self._protocol.send_pos_vel(
             self._node_id,
             waypoint,
@@ -269,22 +324,25 @@ class CubeMarsNode(NodeDriverBase):
 
     def check_watchdog(self):
         """
-        Check for fault conditions on this motor.
+        Check the latest cached status frame without consuming it.
 
-        Reads the latest status frame non-blocking. Checks:
+        Checks:
         - Motor fault code
         - Motor temperature
-        - Driver board temperature
+
+        Feedback freshness is not checked yet because the
+        configured broadcast interval is unknown.
 
         Returns True if healthy, False if a fault was detected.
-        Sets state to FAULT on failure.
+        Sets state to NodeState.FAULT on failure.
         """
-        status = self._protocol.read_status(
-            self._node_id, timeout=0
+
+        status, timestamp = self._protocol.read_latest_status(
+            self._node_id
         )
 
-        # No frame ready this tick — not a fault, motor broadcasts
-        # at its configured rate which may be slower than tick rate
+        # No status frame has ever been received.
+        # start_holding() should already have verified initial feedback.
         if status is None:
             return True
 
@@ -294,6 +352,7 @@ class CubeMarsNode(NodeDriverBase):
                 f" error code {status['error']}"
             )
             self._state = NodeState.FAULT
+            self._motion_enabled = False
             return False
 
         if status['temp'] > MAX_MOTOR_TEMP:
@@ -302,6 +361,7 @@ class CubeMarsNode(NodeDriverBase):
                 f" {status['temp']}C > {MAX_MOTOR_TEMP}C"
             )
             self._state = NodeState.FAULT
+            self._motion_enabled = False
             return False
 
         return True
