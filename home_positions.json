@@ -1,0 +1,30 @@
+{
+    "1": {
+        "name": "Base",
+        "encoder_home": 57681,
+        "gear_ratio": 100,
+        "encoder_cpr": 32768,
+        "timestamp": "2026-09-13T08:58:59.961695+00:00"
+    },
+    "4": {
+        "name": "Gripper Roll",
+        "encoder_home": -139172,
+        "gear_ratio": 50,
+        "encoder_cpr": 32768,
+        "timestamp": "2026-09-13T08:59:34.772830+00:00"
+    },
+    "5": {
+        "name": "Wrist Pitch",
+        "encoder_home": -162517,
+        "gear_ratio": 50,
+        "encoder_cpr": 32768,
+        "timestamp": "2026-09-13T09:00:29.709926+00:00"
+    },
+    "6": {
+        "name": "Wrist Roll",
+        "encoder_home": 464213,
+        "gear_ratio": 50,
+        "encoder_cpr": 32768,
+        "timestamp": "2026-09-13T09:00:57.494484+00:00"
+    }
+}
