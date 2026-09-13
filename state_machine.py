@@ -207,12 +207,14 @@ class ArmStateMachine:
         """
         try:
             # 1. Watchdog
-            if self._state in (ArmState.IDLE, ArmState.MOVING, ArmState.HOMING):
+            if self._state in (ArmState.IDLE, ArmState.MOVING,
+                            ArmState.HOMING):
                 for node in self._nodes.values():
                     if node.state == NodeState.ENABLED:
                         if not node.check_watchdog():
                             self._enter_fault(
-                                f"Watchdog fault on node {node.node_id} ({node.name})"
+                                f"Watchdog fault on node"
+                                f" {node.node_id} ({node.name})"
                             )
                             return
 
@@ -220,11 +222,19 @@ class ArmStateMachine:
             if self._state in (ArmState.MOVING, ArmState.HOMING):
                 self._advance_trajectory()
 
+            # 3. CubeMars idle hold — step at current position
+            #    every tick so position tracking stays accurate.
+            #    Avatar nodes hold passively so don't need this.
+            elif self._state == ArmState.IDLE:
+                for node in self._nodes.values():
+                    if (node.state == NodeState.ENABLED
+                            and node.requires_continuous_hold):
+                        node.step(node.position)
+
         except CanBusError as e:
             self._enter_fault(f"CAN bus error: {e}")
             return
 
-        # 3. Tick counter
         self._tick_count += 1
 
     def status(self) -> ArmStatus:
@@ -266,6 +276,10 @@ class ArmStateMachine:
 
         try:
             for node in self._nodes.values():
+                if node.state == NodeState.ENABLED:
+                    # Already enabled from pre-enable step — skip
+                    print(f"  [{node.name}] Already enabled — skipping")
+                    continue
                 ok = node.enable()
                 if not ok:
                     self._enter_fault(
@@ -301,12 +315,17 @@ class ArmStateMachine:
                 print(f"  [SM] MOVE ignored — unknown node_id: {node_id}")
                 return
 
-        # Convert relative degrees to absolute encoder counts
+        # Use degrees_to_counts for the delta by converting
+        # current + delta through the node's own unit conversion
         encoder_targets = {}
         for node_id, degrees in targets.items():
-            node = self._nodes[node_id]
-            counts_per_deg = node._gear_ratio * node._encoder_cpr / 360
-            encoder_targets[node_id] = node.position + int(degrees * counts_per_deg)
+            node   = self._nodes[node_id]
+            # degrees_to_counts gives absolute target from home
+            # so we need current degrees + delta degrees
+            current_deg = node.counts_to_degrees(node.position)
+            encoder_targets[node_id] = node.degrees_to_counts(
+                current_deg + degrees
+            )
 
         self._build_trajectories(encoder_targets)
         self._state = ArmState.MOVING
@@ -316,7 +335,7 @@ class ArmStateMachine:
             print(
                 f"  [SM] MOVE node {node_id} ({node.name})"
                 f"  {degrees:+.2f}° relative"
-                f"  → {encoder_targets[node_id]} counts"
+                f"  → {encoder_targets[node_id]}"
             )
         print(f"  [SM] {self._total_ticks} steps  → MOVING")
 
@@ -418,9 +437,10 @@ class ArmStateMachine:
         for node_id, target in targets.items():
             node  = self._nodes[node_id]
             start = node.position
-            raw[node_id] = self._make_waypoints(start, target)
+            # Get step size appropriate for this node's units
+            step  = getattr(node, 'waypoint_step', WAYPOINT_STEP)
+            raw[node_id] = self._make_waypoints(start, target, step)
 
-        # Pad shorter lists with their final value
         max_len = max(len(wps) for wps in raw.values()) if raw else 0
         for node_id in raw:
             while len(raw[node_id]) < max_len:
@@ -430,12 +450,16 @@ class ArmStateMachine:
         self._tick_index  = 0
         self._total_ticks = max_len
 
-    def _make_waypoints(self, start, target):
-        """Build a list of encoder count waypoints from start to target."""
+    def _make_waypoints(self, start, target, step_size=WAYPOINT_STEP):
+        """Build a list of waypoints from start to target."""
         delta = target - start
         if delta == 0:
             return [target]
 
+        # Use the node's own step size if it defines one,
+        # otherwise fall back to the global default.
+        # This handles the difference between Avatar (counts)
+        # and CubeMars (degrees) units.
         direction = 1 if delta > 0 else -1
         step      = direction * abs(WAYPOINT_STEP)
 

@@ -105,6 +105,15 @@ class NodeDriverBase(ABC):
         because the TPDO update rate is too slow on these drives.
         """
 
+    @property
+    def requires_continuous_hold(self):
+        """
+        True if this motor requires continuous commands to hold
+        position (e.g. CubeMars), False if it holds passively
+        (e.g. Avatar CANopen).
+        """
+        return False   # default — Avatar motors hold passively
+
     # --------------------------------------------------------
     # Lifecycle
     # --------------------------------------------------------

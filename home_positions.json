@@ -1,30 +1,44 @@
 {
     "1": {
         "name": "Base",
-        "encoder_home": 57681,
+        "encoder_home": 175507,
         "gear_ratio": 100,
         "encoder_cpr": 32768,
-        "timestamp": "2026-09-13T08:58:59.961695+00:00"
+        "timestamp": "2026-09-13T17:10:42.338720+00:00"
     },
     "4": {
         "name": "Gripper Roll",
-        "encoder_home": -139172,
+        "encoder_home": -165497,
         "gear_ratio": 50,
         "encoder_cpr": 32768,
-        "timestamp": "2026-09-13T08:59:34.772830+00:00"
+        "timestamp": "2026-09-13T17:12:22.514018+00:00"
     },
     "5": {
         "name": "Wrist Pitch",
-        "encoder_home": -162517,
+        "encoder_home": -129992,
         "gear_ratio": 50,
         "encoder_cpr": 32768,
-        "timestamp": "2026-09-13T09:00:29.709926+00:00"
+        "timestamp": "2026-09-13T17:12:57.323550+00:00"
     },
     "6": {
         "name": "Wrist Roll",
-        "encoder_home": 464213,
+        "encoder_home": -378996,
         "gear_ratio": 50,
         "encoder_cpr": 32768,
-        "timestamp": "2026-09-13T09:00:57.494484+00:00"
+        "timestamp": "2026-09-13T17:13:01.793249+00:00"
+    },
+    "2": {
+        "name": "Shoulder",
+        "encoder_home": -114.7,
+        "gear_ratio": 1,
+        "encoder_cpr": null,
+        "timestamp": "2026-09-13T17:11:13.245700+00:00"
+    },
+    "3": {
+        "name": "Elbow",
+        "encoder_home": -40.300000000000004,
+        "gear_ratio": 1,
+        "encoder_cpr": null,
+        "timestamp": "2026-09-13T17:12:05.830756+00:00"
     }
 }
